@@ -1,0 +1,114 @@
+pipeline {
+    agent any
+
+    environment {
+        BACKEND_IMAGE = "username/docker-image"
+        FRONTEND_IMAGE = "username/docker-image"
+        
+        // URL interpolation sahi rakhne ke liye yahan se https:// hata diya hai
+        GITOPS_REPO   = "github.com/username/reponame.git"
+        REPO_NAME     = "repo-name"
+    }
+
+    stages {
+
+        stage('Checkout Source Code') {
+            steps {
+                git branch: 'name',
+                    credentialsId: 'github-cred',
+                    url: 'https://github.com/username/repo.git'
+            }
+        }
+
+        stage('Generate Build Tag') {
+            steps {
+                script {
+                    env.TAG = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    echo "📦 Build TAG: ${env.TAG}"
+                }
+            }
+        }
+
+        stage('Build Docker Images') {
+            steps {
+                sh """
+                    docker build -t ${BACKEND_IMAGE}:${TAG} ./server
+                    docker build -t ${FRONTEND_IMAGE}:${TAG} ./client
+                """
+            }
+        }
+
+        stage('Docker Login') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'docker-cred',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh """
+                        echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin
+                    """
+                }
+            }
+        }
+
+        stage('Push Docker Images') {
+            steps {
+                sh """
+                    docker push ${BACKEND_IMAGE}:${TAG}
+                    docker push ${FRONTEND_IMAGE}:${TAG}
+                """
+            }
+        }
+
+        stage('Update GitOps Repo (ArgoCD Trigger)') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'github-cred',
+                    usernameVariable: 'GIT_USER',
+                    passwordVariable: 'GIT_TOKEN'
+                )]) {
+                    // Single quotes use karne se Groovy string interpolation warning nahi aayegi
+                    sh '''
+                        rm -rf ${REPO_NAME}
+                        
+                        # Ab URL bilkul sahi format (https://username:token@github.com/...) me banega
+                        git clone https://${GIT_USER}:${GIT_TOKEN}@${GITOPS_REPO} ${REPO_NAME}
+                        
+                        cd ${REPO_NAME}/k8s
+
+                        sed -i "s|image: .*backend.*|image: ${BACKEND_IMAGE}:${TAG}|g" backend-deployment.yml
+                        sed -i "s|image: .*frontend.*|image: ${FRONTEND_IMAGE}:${TAG}|g" frontend-deployment.yml
+
+                        git add .
+                        git commit -m "🚀 deploy: update images to ${TAG}" || echo "No changes"
+                        git push origin main
+                    '''
+                }
+            }
+        }
+
+        stage('Trigger ArgoCD Sync Check') {
+            steps {
+                sh """
+                    echo "Waiting for ArgoCD sync..."
+                    sleep 10
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ PIPELINE SUCCESS - Build → Push → GitOps Updated"
+        }
+
+        failure {
+            echo "❌ PIPELINE FAILED - Check logs"
+        }
+
+        always {
+            cleanWs()
+        }
+    }
+}
